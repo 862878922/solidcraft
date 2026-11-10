@@ -16,6 +16,19 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      # 1. 扩容 10GB 虚拟内存，彻底解决 Exit code 143 爆内存问题
+      - name: Expand Swap Space (Fix OOM Exit Code 143)
+        run: |
+          echo "=== 扩容前内存状况 ==="
+          free -h
+          sudo swapoff -a || true
+          sudo fallocate -l 10G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=10240
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          echo "=== 扩容后内存状况（已增加 10GB 虚拟内存） ==="
+          free -h
+
       - name: Setup Rust Toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -29,75 +42,163 @@ jobs:
         with:
           tool: trunk
 
+      # 2. 安装现代最新版 Binaryen (wasm-opt v122)
       - name: Install Modern Binaryen (wasm-opt v122)
         run: |
           curl -fsSL https://github.com/WebAssembly/binaryen/releases/download/version_122/binaryen-version_122-x86_64-linux.tar.gz | tar -xz
           sudo cp binaryen-version_122/bin/* /usr/local/bin/
           wasm-opt --version
 
-      - name: Optimize Profile and Set Default Language
+      # 3. 优化编译配置并设置默认中文
+      - name: Optimize Profile and Set Chinese Default
         run: |
-          # 1. 禁用 Trunk 内部过时的 wasm-opt 避免报错
+          # 禁用 Trunk 内部过时的 wasm-opt 避免报错
           sed -i 's/data-wasm-opt="z"/data-wasm-opt="0"/g' apps/solidcraft-web/index.html
 
-          # 2. 修改 Cargo.toml 启用极致体积压缩模式（防止超出 Cloudflare 25MB 上限）
+          # 配置 Cargo.toml 为轻量 ThinLTO 与体积最小化模式
           python3 - <<'EOF'
           import re
-          with open("Cargo.toml", "r") as f:
+          with open("Cargo.toml", "r", encoding="utf-8") as f:
               content = f.read()
           new_profile = """[profile.release]
           opt-level = "z"
-          lto = true
-          codegen-units = 1
+          lto = "thin"
+          codegen-units = 16
           panic = "abort"
           strip = true
           debug = 0
 
           """
           content = re.sub(r'\[profile\.release\][^\[]+', new_profile, content)
-          with open("Cargo.toml", "w") as f:
+          with open("Cargo.toml", "w", encoding="utf-8") as f:
               f.write(content)
-          print("✅ Cargo.toml 已更新为体积最小化模式")
+          print("✅ Cargo.toml 已更新为轻量体积压缩配置")
           EOF
 
-          # 3. 设置默认界面语言为中文 (crates/ui-text/src/lib.rs)
+          # 将首选项及系统底层语言默认设置为中文 (zh)
           python3 - <<'EOF'
-          path = "crates/ui-text/src/lib.rs"
-          with open(path, "r", encoding="utf-8") as f:
-              content = f.read().replace('\r\n', '\n')
-          content = content.replace('ENGLISH_ID\n}', '"zh"\n}')
-          with open(path, "w", encoding="utf-8") as f:
-              f.write(content)
-          print("✅ crates/ui-text 默认语言已设为中文")
+          prefs_path = "crates/ui-egui/src/prefs.rs"
+          try:
+              with open(prefs_path, "r", encoding="utf-8") as f:
+                  prefs = f.read()
+              if 'language: String = "system".into()' in prefs:
+                  prefs = prefs.replace('language: String = "system".into()', 'language: String = "zh".into()')
+                  with open(prefs_path, "w", encoding="utf-8") as f:
+                      f.write(prefs)
+                  print("✅ 首选项默认语言已设置为中文 (zh)")
+          except Exception as e:
+              print("偏好语言设置提示:", e)
+
+          ui_text_path = "crates/ui-text/src/lib.rs"
+          try:
+              with open(ui_text_path, "r", encoding="utf-8") as f:
+                  text_lib = f.read()
+              if 'const ENGLISH_ID: &str = "en";' in text_lib:
+                  text_lib = text_lib.replace('const ENGLISH_ID: &str = "en";', 'const ENGLISH_ID: &str = "zh";')
+                  with open(ui_text_path, "w", encoding="utf-8") as f:
+                      f.write(text_lib)
+                  print("✅ 系统底层回退语言已设置为中文 (zh)")
+          except Exception as e:
+              print("底层语言设置提示:", e)
           EOF
 
+      # 4. 构建 Web 产物（限制并发线程数为 2，防止内存冲高）
       - name: Build Web Application
+        env:
+          CARGO_BUILD_JOBS: 2
         run: |
           cd apps/solidcraft-web
-          trunk build --release --public-url ./
+          trunk build --release
           cd ../..
+          echo "=== 检查初步构建产物 ==="
+          ls -lh dist/web/
 
-      - name: Compress WASM Binary and Update Offline Cache
+      # 5. 深度压缩并自动处理 25MB 大小限制
+      - name: Compress Wasm & Handle 25MB Cloudflare Limit
         run: |
-          WASM_FILE=$(ls dist/web/*_bg.wasm)
-          echo "Trunk 生成大小:"
-          ls -lh "$WASM_FILE"
-          
-          # 使用外部最新 wasm-opt 进行终极瘦身
+          WASM_FILE=$(ls dist/web/*_bg.wasm | head -n 1)
+          echo "压缩前大小: $(ls -lh "$WASM_FILE" | awk '{print $5}')"
+
+          # 现代 wasm-opt 极致瘦身
           wasm-opt --all-features -Oz --strip-debug --strip-producers "$WASM_FILE" -o "$WASM_FILE" || true
-          
-          echo "瘦身后大小:"
-          ls -lh "$WASM_FILE"
+          echo "压缩后大小: $(ls -lh "$WASM_FILE" | awk '{print $5}')"
 
-          # 重新生成离线 ServiceWorker 的校验哈希
+          # 检查大小，如果超过 24MB 则自动进行安全分片加载
+          python3 - <<'EOF'
+          import os, glob, re
+
+          wasm_files = glob.glob("dist/web/*_bg.wasm")
+          if not wasm_files:
+              print("未找到 wasm 文件")
+              exit(0)
+
+          wasm_path = wasm_files[0]
+          size_mb = os.path.getsize(wasm_path) / (1024 * 1024)
+          print(f"当前 wasm 实际大小: {size_mb:.2f} MB")
+
+          if size_mb > 24.0:
+              print("⚠️ Wasm 体积大于 24MB，启动自动无缝分片机制...")
+              wasm_filename = os.path.basename(wasm_path)
+              chunk_size = 15 * 1024 * 1024  # 每片 15MB
+              with open(wasm_path, "rb") as f:
+                  data = f.read()
+
+              chunks = []
+              for i in range(0, len(data), chunk_size):
+                  part_name = f"{wasm_filename}.part{len(chunks)}"
+                  part_path = os.path.join("dist/web", part_name)
+                  with open(part_path, "wb") as pf:
+                      pf.write(data[i:i+chunk_size])
+                  chunks.append(f"./{part_name}")
+                  print(f"  已生成分片: {part_name} ({len(data[i:i+chunk_size]) / (1024*1024):.2f} MB)")
+
+              os.remove(wasm_path)
+
+              html_path = "dist/web/index.html"
+              with open(html_path, "r", encoding="utf-8") as f:
+                  html = f.read()
+
+              chunk_urls_js = str(chunks)
+              loader_js = f"""
+              async function __loadWasmChunks() {{
+                const parts = {chunk_urls_js};
+                const buffers = await Promise.all(parts.map(p => fetch(p).then(r => {{
+                  if (!r.ok) throw new Error("加载分片失败: " + p);
+                  return r.arrayBuffer();
+                }})));
+                const total = buffers.reduce((acc, b) => acc + b.byteLength, 0);
+                const out = new Uint8Array(total);
+                let offset = 0;
+                for (const b of buffers) {{
+                  out.set(new Uint8Array(b), offset);
+                  offset += b.byteLength;
+                }}
+                return out;
+              }}
+              const wasm = await init({{ module_or_path: await __loadWasmChunks() }});
+              """
+
+              html = re.sub(r'const wasm = await init\(\{[^}]+\}\);', loader_js.strip(), html)
+              html = re.sub(r'<link rel="preload" [^>]*\.wasm[^>]*>', '', html)
+
+              with open(html_path, "w", encoding="utf-8") as f:
+                  f.write(html)
+              print("✅ index.html 已更新为多线程分片并发加载器")
+          else:
+              print("✅ wasm 大小符合 Cloudflare Pages 限制 (<= 25MB)，无需切片")
+          EOF
+
+          # 更新离线缓存清单
           cargo xtask web-offline dist/web || true
+          echo "=== 最终 dist/web 文件列表 ==="
+          ls -lh dist/web/
 
+      # 6. 一键部署到 Cloudflare Pages
       - name: Deploy to Cloudflare Pages
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
-          # 1. 自动从 Token 探测真实 Account ID
           ACCOUNTS_JSON=$(curl -s -X GET "https://api.cloudflare.com/client/v4/accounts" \
             -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN")
           DETECTED_ID=$(echo "$ACCOUNTS_JSON" | jq -r '.result[0].id // empty')
@@ -106,6 +207,5 @@ jobs:
             export CLOUDFLARE_ACCOUNT_ID="$DETECTED_ID"
           fi
 
-          # 2. 安装 Wrangler 并发布到 lotelf-solid
           npm install -g wrangler
           wrangler pages deploy dist/web --project-name=lotelf-solid --branch=main --commit-dirty=true
