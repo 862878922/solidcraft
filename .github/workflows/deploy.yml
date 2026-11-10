@@ -1,0 +1,111 @@
+name: Deploy SolidCraft to Cloudflare Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  deployments: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Trunk
+        uses: taiki-e/install-action@v2
+        with:
+          tool: trunk
+
+      - name: Install Modern Binaryen (wasm-opt v122)
+        run: |
+          curl -fsSL https://github.com/WebAssembly/binaryen/releases/download/version_122/binaryen-version_122-x86_64-linux.tar.gz | tar -xz
+          sudo cp binaryen-version_122/bin/* /usr/local/bin/
+          wasm-opt --version
+
+      - name: Optimize Profile and Set Default Language
+        run: |
+          # 1. 禁用 Trunk 内部过时的 wasm-opt 避免报错
+          sed -i 's/data-wasm-opt="z"/data-wasm-opt="0"/g' apps/solidcraft-web/index.html
+
+          # 2. 修改 Cargo.toml 启用极致体积压缩模式（防止超出 Cloudflare 25MB 上限）
+          python3 - <<'EOF'
+          import re
+          with open("Cargo.toml", "r") as f:
+              content = f.read()
+          new_profile = """[profile.release]
+          opt-level = "z"
+          lto = true
+          codegen-units = 1
+          panic = "abort"
+          strip = true
+          debug = 0
+
+          """
+          content = re.sub(r'\[profile\.release\][^\[]+', new_profile, content)
+          with open("Cargo.toml", "w") as f:
+              f.write(content)
+          print("✅ Cargo.toml 已更新为体积最小化模式")
+          EOF
+
+          # 3. 设置默认界面语言为中文 (crates/ui-text/src/lib.rs)
+          python3 - <<'EOF'
+          path = "crates/ui-text/src/lib.rs"
+          with open(path, "r", encoding="utf-8") as f:
+              content = f.read().replace('\r\n', '\n')
+          content = content.replace('ENGLISH_ID\n}', '"zh"\n}')
+          with open(path, "w", encoding="utf-8") as f:
+              f.write(content)
+          print("✅ crates/ui-text 默认语言已设为中文")
+          EOF
+
+      - name: Build Web Application
+        run: |
+          cd apps/solidcraft-web
+          trunk build --release --public-url ./
+          cd ../..
+
+      - name: Compress WASM Binary and Update Offline Cache
+        run: |
+          WASM_FILE=$(ls dist/web/*_bg.wasm)
+          echo "Trunk 生成大小:"
+          ls -lh "$WASM_FILE"
+          
+          # 使用外部最新 wasm-opt 进行终极瘦身
+          wasm-opt --all-features -Oz --strip-debug --strip-producers "$WASM_FILE" -o "$WASM_FILE" || true
+          
+          echo "瘦身后大小:"
+          ls -lh "$WASM_FILE"
+
+          # 重新生成离线 ServiceWorker 的校验哈希
+          cargo xtask web-offline dist/web || true
+
+      - name: Deploy to Cloudflare Pages
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          # 1. 自动从 Token 探测真实 Account ID
+          ACCOUNTS_JSON=$(curl -s -X GET "https://api.cloudflare.com/client/v4/accounts" \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN")
+          DETECTED_ID=$(echo "$ACCOUNTS_JSON" | jq -r '.result[0].id // empty')
+          
+          if [ -n "$DETECTED_ID" ] && [ "$DETECTED_ID" != "null" ]; then
+            export CLOUDFLARE_ACCOUNT_ID="$DETECTED_ID"
+          fi
+
+          # 2. 安装 Wrangler 并发布到 lotelf-solid
+          npm install -g wrangler
+          wrangler pages deploy dist/web --project-name=lotelf-solid --branch=main --commit-dirty=true
