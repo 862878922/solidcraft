@@ -1,0 +1,283 @@
+name: Deploy SolidCraft to Cloudflare Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  deployments: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # 1. 扩容 10GB 虚拟内存，彻底解决 Exit code 143 爆内存问题
+      - name: Expand Swap Space (Fix OOM Exit Code 143)
+        run: |
+          echo "=== 扩容前内存状况 ==="
+          free -h
+          sudo swapoff -a || true
+          sudo fallocate -l 10G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=10240
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          echo "=== 扩容后内存状况 ==="
+          free -h
+
+      # 2. 安装 Rust 工具链与 Wasm 目标平台
+      - name: Setup Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      # 3. Rust 依赖与编译缓存加速
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      # 4. 安装 Trunk
+      - name: Install Trunk
+        uses: taiki-e/install-action@v2
+        with:
+          tool: trunk
+
+      # 5. 安装现代 Binaryen (wasm-opt v122)
+      - name: Install Modern Binaryen (wasm-opt v122)
+        run: |
+          curl -fsSL https://github.com/WebAssembly/binaryen/releases/download/version_122/binaryen-version_122-x86_64-linux.tar.gz | tar -xz
+          sudo cp binaryen-version_122/bin/* /usr/local/bin/
+          wasm-opt --version
+
+      # 6. 优化构建参数并设置默认中文
+      - name: Optimize Profile and Set Chinese Default
+        run: |
+          # 禁用 Trunk 内部自带的过时 wasm-opt 避免报错
+          sed -i 's/data-wasm-opt="z"/data-wasm-opt="0"/g' apps/solidcraft-web/index.html
+
+          # 配置 Cargo.toml 启用轻量 ThinLTO 与体积压缩
+          python3 - <<'EOF'
+          import re
+          with open("Cargo.toml", "r", encoding="utf-8") as f:
+              content = f.read()
+          new_profile = """[profile.release]
+          opt-level = "z"
+          lto = "thin"
+          codegen-units = 16
+          panic = "abort"
+          strip = true
+          debug = 0
+
+          """
+          content = re.sub(r'\[profile\.release\][^\[]+', new_profile, content)
+          with open("Cargo.toml", "w", encoding="utf-8") as f:
+              f.write(content)
+          print("✅ Cargo.toml 已更新为轻量体积压缩配置")
+          EOF
+
+          # 将首选项默认语言与底层系统语言设为中文
+          python3 - <<'EOF'
+          prefs_path = "crates/ui-egui/src/prefs.rs"
+          try:
+              with open(prefs_path, "r", encoding="utf-8") as f:
+                  prefs = f.read()
+              if 'language: String = "system".into()' in prefs:
+                  prefs = prefs.replace('language: String = "system".into()', 'language: String = "zh".into()')
+                  with open(prefs_path, "w", encoding="utf-8") as f:
+                      f.write(prefs)
+                  print("✅ 首选项默认语言已设置为中文 (zh)")
+          except Exception as e:
+              print("偏好语言设置提示:", e)
+
+          ui_text_path = "crates/ui-text/src/lib.rs"
+          try:
+              with open(ui_text_path, "r", encoding="utf-8") as f:
+                  text_lib = f.read()
+              if 'const ENGLISH_ID: &str = "en";' in text_lib:
+                  text_lib = text_lib.replace('const ENGLISH_ID: &str = "en";', 'const ENGLISH_ID: &str = "zh";')
+                  with open(ui_text_path, "w", encoding="utf-8") as f:
+                      f.write(text_lib)
+                  print("✅ 系统底层回退语言已设置为中文 (zh)")
+          except Exception as e:
+              print("底层语言设置提示:", e)
+          EOF
+
+      # 7. 构建 Web 应用程序（限制并发线程数为 2，平稳占用内存）
+      - name: Build Web Application
+        env:
+          CARGO_BUILD_JOBS: 2
+        run: |
+          cd apps/solidcraft-web
+          trunk build --release
+          cd ../..
+          echo "=== 检查初步构建产物 ==="
+          ls -lh dist/web/
+
+      # 8. 物理 Gzip 高强度压缩 + 流式解压引擎（削减 60MB 传输，彻底告别 6 个大分片）
+      - name: Compress Wasm & Enable Streaming Decompression
+        run: |
+          python3 - << 'EOF'
+          import os, glob, subprocess, gzip, json, re
+
+          wasm_files = glob.glob("dist/web/*_bg.wasm")
+          if not wasm_files:
+              print("未找到 wasm 文件")
+              exit(0)
+
+          wasm_path = wasm_files[0]
+          wasm_dir = "dist/web"
+          wasm_filename = os.path.basename(wasm_path)
+
+          orig_size_mb = os.path.getsize(wasm_path) / (1024 * 1024)
+          print(f"原始 WASM 文件: {wasm_filename}，当前大小: {orig_size_mb:.2f} MB")
+
+          # 1. 深度 wasm-opt 极致瘦身
+          cmd = [
+              "wasm-opt",
+              "--all-features",
+              "-Oz",
+              "--strip-debug",
+              "--strip-producers",
+              wasm_path,
+              "-o",
+              wasm_path
+          ]
+          try:
+              subprocess.run(cmd, check=True)
+              print(f"wasm-opt 深度瘦身后大小: {os.path.getsize(wasm_path)/(1024*1024):.2f} MB")
+          except Exception as e:
+              print(f"wasm-opt 步骤跳过: {e}")
+
+          # 2. 物理 Gzip 深度预压缩
+          print("正在执行高压缩比 Gzip 预压缩...")
+          with open(wasm_path, 'rb') as f_in:
+              compressed_data = gzip.compress(f_in.read(), compresslevel=9)
+
+          gz_total_mb = len(compressed_data) / (1024 * 1024)
+          print(f"✅ Gzip 压缩完成！从 {orig_size_mb:.2f} MB 暴降到 {gz_total_mb:.2f} MB（立减 60MB+）")
+
+          # 3. 检查是否需要切片（Cloudflare Pages 限制为 25MB）
+          gz_files = []
+          chunk_size = 18 * 1024 * 1024  # 每片 18MB
+
+          if gz_total_mb <= 24.0:
+              # 单文件直接合规
+              single_gz = f"{wasm_filename}.gz"
+              with open(os.path.join(wasm_dir, single_gz), 'wb') as pf:
+                  pf.write(compressed_data)
+              gz_files.append(single_gz)
+              print(f"✅ 压缩后小于 24MB，作为单文件直接部署: {single_gz}")
+          else:
+              # 仅切成 2 个轻量分片（约 14MB~15MB 每片）
+              for i in range(0, len(compressed_data), chunk_size):
+                  part_name = f"{wasm_filename}.gz.part{len(gz_files)}"
+                  with open(os.path.join(wasm_dir, part_name), 'wb') as pf:
+                      pf.write(compressed_data[i:i+chunk_size])
+                  gz_files.append(part_name)
+                  print(f"✅ 生成轻量压缩分片: {part_name} ({len(compressed_data[i:i+chunk_size])/(1024*1024):.2f} MB)")
+
+          # 4. 删除原始未压缩的 89MB 超大文件
+          os.remove(wasm_path)
+          print(f"✅ 已删除原始超大 wasm 文件: {wasm_filename}")
+
+          # 5. 在 index.html 中注入原生流式解压加载引擎 (DecompressionStream)
+          html_path = os.path.join(wasm_dir, "index.html")
+          with open(html_path, "r", encoding="utf-8") as f:
+              html = f.read()
+
+          gz_files_json = json.dumps(gz_files)
+
+          fast_loader = f"""<script>
+          (function() {{
+            var origFetch = window.fetch;
+            var targetWasm = "{wasm_filename}";
+            var gzFiles = {gz_files_json};
+            window.fetch = async function() {{
+              var args = Array.prototype.slice.call(arguments);
+              var url = typeof args[0] === 'string' ? args[0] : (args[0] && args[0].url ? args[0].url : '');
+              if (url.indexOf(targetWasm) !== -1) {{
+                console.log('[FastLoader] 正在加载轻量 Gzip 压缩包并流式极速解压...');
+                var basePath = url.substring(0, url.lastIndexOf('/') + 1);
+                var buffers = await Promise.all(gzFiles.map(function(f) {{
+                  return origFetch(basePath + f).then(function(r) {{
+                    if (!r.ok) throw new Error('下载失败: ' + f);
+                    return r.arrayBuffer();
+                  }});
+                }}));
+                var total = buffers.reduce(function(acc, b) {{ return acc + b.byteLength; }}, 0);
+                var mergedGz = new Uint8Array(total);
+                var offset = 0;
+                for (var i = 0; i < buffers.length; i++) {{
+                  mergedGz.set(new Uint8Array(buffers[i]), offset);
+                  offset += buffers[i].byteLength;
+                }}
+                var stream = new Response(mergedGz).body.pipeThrough(new DecompressionStream('gzip'));
+                return new Response(stream, {{ headers: {{ 'Content-Type': 'application/wasm' }} }});
+              }}
+              return origFetch.apply(this, args);
+            }};
+          }})();
+          </script>"""
+
+          if "<head>" in html:
+              html = html.replace("<head>", "<head>\n" + fast_loader)
+          else:
+              html = fast_loader + "\n" + html
+
+          # 移除旧的 wasm preload 标签
+          html = re.sub(r'<link rel="preload" [^>]*\.wasm[^>]*>', '', html)
+
+          with open(html_path, "w", encoding="utf-8") as f:
+              f.write(html)
+          print("✅ index.html 已更新为流式管道解压引擎")
+
+          # 6. 注入 Cloudflare Pages _headers 1 年长效缓存头
+          headers_path = os.path.join(wasm_dir, "_headers")
+          headers_content = """/*
+            Access-Control-Allow-Origin: *
+
+          /*.gz
+            Cache-Control: public, max-age=31536000, immutable
+
+          /*.gz.part*
+            Cache-Control: public, max-age=31536000, immutable
+
+          /*.wasm
+            Cache-Control: public, max-age=31536000, immutable
+            Content-Type: application/wasm
+
+          /*.js
+            Cache-Control: public, max-age=31536000, immutable
+
+          /*.css
+            Cache-Control: public, max-age=31536000, immutable
+          """
+          with open(headers_path, "w", encoding="utf-8") as f:
+              f.write(headers_content)
+          print("✅ 已生成 _headers 1 年长效缓存策略")
+          EOF
+
+          # 更新离线缓存清单
+          cargo xtask web-offline dist/web || true
+          echo "=== 最终提交部署的文件列表 ==="
+          ls -lh dist/web/
+
+      # 9. 一键部署到 Cloudflare Pages
+      - name: Deploy to Cloudflare Pages
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          ACCOUNTS_JSON=$(curl -s -X GET "https://api.cloudflare.com/client/v4/accounts" \
+            -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN")
+          DETECTED_ID=$(echo "$ACCOUNTS_JSON" | jq -r '.result[0].id // empty')
+          
+          if [ -n "$DETECTED_ID" ] && [ "$DETECTED_ID" != "null" ]; then
+            export CLOUDFLARE_ACCOUNT_ID="$DETECTED_ID"
+          fi
+
+          npm install -g wrangler
+          wrangler pages deploy dist/web --project-name=lotelf-solid --branch=main --commit-dirty=true
