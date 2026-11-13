@@ -116,8 +116,8 @@ jobs:
           echo "=== 检查初步构建产物 ==="
           ls -lh dist/web/
 
-      # 8. 物理 Gzip 高强度压缩 + 流式解压引擎（削减 60MB 传输，彻底告别 6 个大分片）
-      - name: Compress Wasm & Enable Streaming Decompression
+      # 8. 物理 Gzip 高强度压缩 + 流式解压引擎 + CacheStorage 本地极速秒开 + 50ms 3D 原生工作台拟真首屏
+      - name: Compress Wasm, Inject CacheStorage & 3D Instant App Shell
         run: |
           python3 - << 'EOF'
           import os, glob, subprocess, gzip, json, re
@@ -157,21 +157,19 @@ jobs:
               compressed_data = gzip.compress(f_in.read(), compresslevel=9)
 
           gz_total_mb = len(compressed_data) / (1024 * 1024)
-          print(f"✅ Gzip 压缩完成！从 {orig_size_mb:.2f} MB 暴降到 {gz_total_mb:.2f} MB（立减 60MB+）")
+          print(f"✅ Gzip 压缩完成！从 {orig_size_mb:.2f} MB 暴降到 {gz_total_mb:.2f} MB") 
 
           # 3. 检查是否需要切片（Cloudflare Pages 限制为 25MB）
           gz_files = []
           chunk_size = 18 * 1024 * 1024  # 每片 18MB
 
           if gz_total_mb <= 24.0:
-              # 单文件直接合规
               single_gz = f"{wasm_filename}.gz"
               with open(os.path.join(wasm_dir, single_gz), 'wb') as pf:
                   pf.write(compressed_data)
               gz_files.append(single_gz)
               print(f"✅ 压缩后小于 24MB，作为单文件直接部署: {single_gz}")
           else:
-              # 仅切成 2 个轻量分片（约 14MB~15MB 每片）
               for i in range(0, len(compressed_data), chunk_size):
                   part_name = f"{wasm_filename}.gz.part{len(gz_files)}"
                   with open(os.path.join(wasm_dir, part_name), 'wb') as pf:
@@ -179,11 +177,11 @@ jobs:
                   gz_files.append(part_name)
                   print(f"✅ 生成轻量压缩分片: {part_name} ({len(compressed_data[i:i+chunk_size])/(1024*1024):.2f} MB)")
 
-          # 4. 删除原始未压缩的 89MB 超大文件
+          # 4. 删除原始未压缩的超大文件
           os.remove(wasm_path)
           print(f"✅ 已删除原始超大 wasm 文件: {wasm_filename}")
 
-          # 5. 在 index.html 中注入原生流式解压加载引擎 (DecompressionStream)
+          # 5. 在 index.html 中注入原生流式解压 + CacheStorage 本地持久化极速加载器
           html_path = os.path.join(wasm_dir, "index.html")
           with open(html_path, "r", encoding="utf-8") as f:
               html = f.read()
@@ -195,18 +193,40 @@ jobs:
             var origFetch = window.fetch;
             var targetWasm = "{wasm_filename}";
             var gzFiles = {gz_files_json};
+            var CACHE_NAME = 'solidcraft-cache-v1';
+
             window.fetch = async function() {{
               var args = Array.prototype.slice.call(arguments);
               var url = typeof args[0] === 'string' ? args[0] : (args[0] && args[0].url ? args[0].url : '');
               if (url.indexOf(targetWasm) !== -1) {{
-                console.log('[FastLoader] 正在加载轻量 Gzip 压缩包并流式极速解压...');
+                console.log('[FastLoader] 正在加载 3D 核心 Gzip 资源包...');
                 var basePath = url.substring(0, url.lastIndexOf('/') + 1);
-                var buffers = await Promise.all(gzFiles.map(function(f) {{
-                  return origFetch(basePath + f).then(function(r) {{
-                    if (!r.ok) throw new Error('下载失败: ' + f);
-                    return r.arrayBuffer();
-                  }});
+                var cache = null;
+                if ('caches' in window) {{
+                  try {{ cache = await caches.open(CACHE_NAME); }} catch(e) {{}}
+                }}
+
+                var buffers = await Promise.all(gzFiles.map(async function(f) {{
+                  var fileUrl = basePath + f;
+                  if (cache) {{
+                    try {{
+                      var match = await cache.match(fileUrl);
+                      if (match) {{
+                        console.log('[FastLoader] 命中 CacheStorage 本地缓存: ' + f);
+                        var p = document.getElementById('shell-step-desc');
+                        if (p) p.innerText = '正在从本地超高速缓存载入 (' + f + ')...';
+                        return match.arrayBuffer();
+                      }}
+                    }} catch(e) {{}}
+                  }}
+                  var resp = await origFetch(fileUrl);
+                  if (!resp.ok) throw new Error('下载失败: ' + f);
+                  if (cache) {{
+                    try {{ cache.put(fileUrl, resp.clone()); }} catch(e) {{}}
+                  }}
+                  return resp.arrayBuffer();
                 }}));
+
                 var total = buffers.reduce(function(acc, b) {{ return acc + b.byteLength; }}, 0);
                 var mergedGz = new Uint8Array(total);
                 var offset = 0;
@@ -230,11 +250,138 @@ jobs:
           # 移除旧的 wasm preload 标签
           html = re.sub(r'<link rel="preload" [^>]*\.wasm[^>]*>', '', html)
 
+          # 6. 注入 50ms 拟真 3D 原生工作台首屏 (Instant App Shell) + 时间差操作捕获
+          app_shell_dom = """
+          <!-- [Instant App Shell] 50ms 极速拟真首屏 -->
+          <div id="solidcraft-app-shell" style="position:fixed;top:0;left:0;width:100vw;height:100vh;background-color:#1b1e23;color:#e2e8f0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;z-index:999999;display:flex;flex-direction:column;user-select:none;">
+            <!-- 顶栏模拟 -->
+            <div style="height:40px;background:#14171b;display:flex;align-items:center;padding:0 12px;border-bottom:1px solid #282d35;font-size:13px;justify-content:space-between;">
+              <div style="display:flex;align-items:center;gap:12px;">
+                <span style="font-weight:600;color:#0ea5e9;display:flex;align-items:center;gap:6px;">
+                  🎲 SolidCraft 三维实体建模
+                </span>
+                <span style="color:#374151;">|</span>
+                <span style="color:#94a3b8;cursor:pointer;">文件</span>
+                <span style="color:#94a3b8;cursor:pointer;">特征</span>
+                <span style="color:#94a3b8;cursor:pointer;">草图</span>
+                <span style="color:#94a3b8;cursor:pointer;">装配</span>
+                <span style="color:#94a3b8;cursor:pointer;">渲染</span>
+                <span style="color:#94a3b8;cursor:pointer;">工具</span>
+                <span style="color:#94a3b8;cursor:pointer;">帮助</span>
+              </div>
+              <div id="engine-status-tag" style="font-size:12px;color:#94a3b8;display:flex;align-items:center;gap:6px;background:#1e232a;padding:3px 10px;border-radius:12px;border:1px solid #2d3440;">
+                <span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#eab308;animation:pulse 1.5s infinite;"></span>
+                <span id="engine-status-text">3D 几何引擎就绪中...</span>
+              </div>
+            </div>
+
+            <!-- 主工作区模拟 -->
+            <div style="flex:1;display:flex;position:relative;background:#0f1216;">
+              <!-- 左侧 3D 建模工具栏 -->
+              <div style="width:48px;background:#14171b;border-right:1px solid #282d35;display:flex;flex-direction:column;align-items:center;padding:12px 0;gap:16px;color:#64748b;font-size:16px;">
+                <div title="选择工具" style="cursor:pointer;color:#0ea5e9;">⤹</div>
+                <div title="拉伸凸台" style="cursor:pointer;">⬢</div>
+                <div title="旋转实体" style="cursor:pointer;">🔄</div>
+                <div title="抽壳与孔" style="cursor:pointer;">🕳</div>
+                <div title="倒角圆角" style="cursor:pointer;">🗜</div>
+                <div title="三维草图" style="cursor:pointer;">📐</div>
+              </div>
+
+              <!-- 中间 3D 视口与欢迎面板 -->
+              <div style="flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;position:relative;overflow:hidden;">
+                <!-- 拟真 3D 透视网格地平面 -->
+                <div style="position:absolute;inset:0;background-image:linear-gradient(#20252e 1px, transparent 1px), linear-gradient(90deg, #20252e 1px, transparent 1px);background-size:32px 32px;opacity:0.4;perspective:600px;transform:rotateX(45deg) scale(1.6);transform-origin:center center;"></div>
+
+                <!-- 拟真空间三轴标识 -->
+                <div style="position:absolute;bottom:24px;left:24px;display:flex;flex-direction:column;font-size:11px;font-weight:bold;gap:2px;opacity:0.75;">
+                  <span style="color:#ef4444;">— X 轴</span>
+                  <span style="color:#22c55e;">— Y 轴</span>
+                  <span style="color:#3b82f6;">— Z 轴</span>
+                </div>
+
+                <!-- 欢迎引导中心卡片 -->
+                <div style="position:relative;background:rgba(20,23,27,0.95);border:1px solid #2d3440;border-radius:8px;padding:28px 36px;box-shadow:0 16px 40px rgba(0,0,0,0.6);text-align:center;max-width:440px;width:90%;backdrop-filter:blur(6px);">
+                  <div style="font-size:20px;font-weight:600;margin-bottom:8px;color:#f8fafc;">欢迎使用 SolidCraft</div>
+                  <div style="font-size:13px;color:#94a3b8;margin-bottom:24px;">轻量、免安装的高性能 Web 3D 实体建模与 CAD 造型工作台</div>
+                  
+                  <div style="display:flex;flex-direction:column;gap:10px;">
+                    <label style="background:#0284c7;color:#fff;padding:10px 18px;border-radius:6px;font-size:14px;cursor:pointer;font-weight:500;transition:background 0.2s;display:flex;align-items:center;justify-content:center;gap:8px;">
+                      📂 导入本地三维模型 (STEP / STL / OBJ)
+                      <input type="file" id="shell-file-input" accept=".step,.stp,.stl,.obj,.brep,.iges" style="display:none;" />
+                    </label>
+                    <button id="shell-new-btn" style="background:#1e232a;color:#e2e8f0;border:1px solid #374151;padding:9px 18px;border-radius:6px;font-size:14px;cursor:pointer;font-weight:500;">
+                      ➕ 新建三维零件实体
+                    </button>
+                    <button id="shell-demo-btn" style="background:transparent;color:#0ea5e9;border:none;padding:6px;font-size:13px;cursor:pointer;">
+                      🚀 载入官方精密装配样例 (减速器)
+                    </button>
+                  </div>
+
+                  <!-- 进度条提示 -->
+                  <div style="margin-top:24px;border-top:1px solid #282d35;padding-top:16px;">
+                    <div style="display:flex;justify-content:space-between;font-size:12px;color:#64748b;margin-bottom:6px;">
+                      <span id="shell-step-desc">正在拉取 3D 几何内核与着色引擎...</span>
+                      <span id="shell-progress-num">0%</span>
+                    </div>
+                    <div style="width:100%;height:4px;background:#282d35;border-radius:2px;overflow:hidden;">
+                      <div id="shell-progress-bar" style="width:16%;height:100%;background:#0ea5e9;transition:width 0.3s ease;"></div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+          <style>
+          @keyframes pulse {
+            0%, 100% { opacity: 1; transform: scale(1); }
+            50% { opacity: 0.4; transform: scale(0.85); }
+          }
+          </style>
+          <script>
+          // 时间差操作捕获
+          window._solidcraft_stashed_file = null;
+          window._solidcraft_action = null;
+
+          document.getElementById('shell-file-input').addEventListener('change', function(e) {
+            if (e.target.files && e.target.files[0]) {
+              window._solidcraft_stashed_file = e.target.files[0];
+              document.getElementById('shell-step-desc').innerText = "已选择: " + e.target.files[0].name + " (等待引擎启动)";
+            }
+          });
+          document.getElementById('shell-new-btn').addEventListener('click', function() {
+            window._solidcraft_action = 'new';
+            document.getElementById('shell-step-desc').innerText = "正在为您初始化空白三维空间...";
+          });
+          document.getElementById('shell-demo-btn').addEventListener('click', function() {
+            window._solidcraft_action = 'demo';
+            document.getElementById('shell-step-desc').innerText = "正在载入精密减速器装配样例...";
+          });
+
+          // 核心启动完成后无缝平滑淡出
+          window.addEventListener('TrunkApplicationStarted', function() {
+            var shell = document.getElementById('solidcraft-app-shell');
+            if (shell) {
+              document.getElementById('engine-status-text').innerText = "3D 核心已就绪";
+              document.getElementById('shell-progress-bar').style.width = "100%";
+              document.getElementById('shell-progress-num').innerText = "100%";
+              setTimeout(function() {
+                shell.style.transition = 'opacity 0.4s ease';
+                shell.style.opacity = '0';
+                setTimeout(function() { shell.remove(); }, 400);
+              }, 150);
+            }
+          });
+          </script>
+          """
+
+          if "solidcraft-app-shell" not in html:
+              html = html.replace("<body", app_shell_dom + "\n<body")
+              print("✅ 已成功将 3D 原生工作台首屏注入到 dist/web/index.html")
+
           with open(html_path, "w", encoding="utf-8") as f:
               f.write(html)
-          print("✅ index.html 已更新为流式管道解压引擎")
 
-          # 6. 注入 Cloudflare Pages _headers 1 年长效缓存头
+          # 7. 注入 Cloudflare Pages _headers 1 年长效缓存头
           headers_path = os.path.join(wasm_dir, "_headers")
           headers_content = """/*
             Access-Control-Allow-Origin: *
@@ -260,17 +407,17 @@ jobs:
           print("✅ 已生成 _headers 1 年长效缓存策略")
           EOF
 
-          # 更新离线缓存清单
           cargo xtask web-offline dist/web || true
           echo "=== 最终提交部署的文件列表 ==="
           ls -lh dist/web/
 
-      # 9. 一键部署到 Cloudflare Pages
+      # 9. 部署发布到 Cloudflare Pages (lotelf-solid)
       - name: Deploy to Cloudflare Pages
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
+          # 1. 自动从 Token 探测真实 Account ID
           ACCOUNTS_JSON=$(curl -s -X GET "https://api.cloudflare.com/client/v4/accounts" \
             -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN")
           DETECTED_ID=$(echo "$ACCOUNTS_JSON" | jq -r '.result[0].id // empty')
@@ -279,5 +426,27 @@ jobs:
             export CLOUDFLARE_ACCOUNT_ID="$DETECTED_ID"
           fi
 
+          # 2. 安装 Wrangler
           npm install -g wrangler
-          wrangler pages deploy dist/web --project-name=lotelf-solid --branch=main --commit-dirty=true
+
+          # 3. 发布到 Cloudflare Pages (带 5 次自动重试机制，对抗 503 抖动)
+          MAX_RETRIES=5
+          RETRY_COUNT=0
+          SUCCESS=0
+
+          until [ $RETRY_COUNT -ge $MAX_RETRIES ]; do
+            echo "🚀 正在发布到 Cloudflare Pages (尝试 $((RETRY_COUNT+1))/$MAX_RETRIES)..."
+            if wrangler pages deploy dist/web --project-name=lotelf-solid --branch=main --commit-dirty=true; then
+              echo "✅ Cloudflare Pages 发布成功！"
+              SUCCESS=1
+              break
+            fi
+            RETRY_COUNT=$((RETRY_COUNT+1))
+            echo "⚠️ 遇到 Cloudflare API 波动或 503，等待 15 秒后进行第 $RETRY_COUNT 次重试..."
+            sleep 15
+          done
+
+          if [ $SUCCESS -ne 1 ]; then
+            echo "❌ 连续重试 $MAX_RETRIES 次后发布失败，请检查网络或 Cloudflare 状态。"
+            exit 1
+          fi
